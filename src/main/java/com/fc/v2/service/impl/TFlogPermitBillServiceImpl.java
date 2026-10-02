@@ -9,6 +9,12 @@ import com.fc.v2.service.ITFlogPermitBillService;
 /**
  * 采伐许可证逐级核签单 Service业务层处理（approval-chain 形状：多阶段签批）
  *
+ * 口径约定（签批 / 否决 / 退回三个入口同一出处，不得另判）：
+ * 1.仅在核（status=0；存量缺失按在核兜底）单据可操作，已核讫/已打回一律拒绝；
+ * 2.或签一票即推进，会签须签满本级应签人数才推进，未签足只计票不挪环节；
+ * 3.否决立即置"已打回"终态并作废本轮票数，单据停在原环节但不得再签；
+ * 4.退回上一环节同时清零票数，杜绝上一轮残票带到退回后的环节。
+ *
  * @author fuce
  * @date 2026-09-14
  */
@@ -32,57 +38,37 @@ public class TFlogPermitBillServiceImpl implements ITFlogPermitBillService {
 
     @Override
     public TFlogPermitBill approve(Long id, String approver, String comment) {
-        if (id == null) {
-            return null;
-        }
-        if (approver == null || approver.trim().isEmpty()) {
-            return null;
-        }
-        if (approver.trim().length() > 32) {
-            return null;
-        }
-        TFlogPermitBill r = findRunning(id);
+        TFlogPermitBill r = loadForAction(id, approver);
         if (r == null) {
-            return null;
-        }
-        // 结构合法性校验：环节越界/应签人数非正/票数越界 一律视为脏数据，不予签批
-        if (!sane(r)) {
             return null;
         }
         int mode = resolveMode(r);
         int need = resolveNeed(r);
         int cnt = vote(r);
-        if (mode == MODE_AND && cnt >= need) {
-            // 会签已满但上一轮推进被中断：本次补推进，不再重复计票
+        if (cnt >= need) {
+            // 本级票已签满（如会签满员后上一轮推进被中断的存量数据）：只补推进，绝不重复计票
             advance(r);
             this.flogPermitBillMapper.updateById(r);
             return r;
         }
         cnt = cnt + 1;
         r.setSignCount(Integer.valueOf(cnt));
-        // 或签一票即推进；会签满员推进（推进/结案口径唯一出处）
-        advance(r);
+        // 或签一票即满、会签满员才推进；未签足时留在原环节继续等票（推进/结案口径唯一出处）
+        if (mode == MODE_OR || cnt >= need) {
+            advance(r);
+        }
         this.flogPermitBillMapper.updateById(r);
         return r;
     }
 
     @Override
     public TFlogPermitBill reject(Long id, String approver, String comment) {
-        if (id == null) {
-            return null;
-        }
-        if (approver == null || approver.trim().isEmpty()) {
-            return null;
-        }
-        TFlogPermitBill r = findRunning(id);
+        TFlogPermitBill r = loadForAction(id, approver);
         if (r == null) {
-            // 已结案（已通过/已否决）或不存在：不得再否决
             return null;
         }
-        if (!sane(r)) {
-            return null;
-        }
-        // 否决即终止整条链：作废本轮签署
+        // 否决即终止整条链：置"已打回"终态并作废本轮签署，单据留在原环节且此后三入口均不得再动
+        r.setStatus(Integer.valueOf(STATUS_VETO));
         r.setSignCount(Integer.valueOf(0));
         this.flogPermitBillMapper.updateById(r);
         return r;
@@ -100,6 +86,7 @@ public class TFlogPermitBillServiceImpl implements ITFlogPermitBillService {
         if (r == null) {
             return null;
         }
+        // 结构合法性校验：环节越界/应签人数非正/票数越界 一律视为脏数据，不予退回
         if (!sane(r)) {
             return null;
         }
@@ -109,12 +96,38 @@ public class TFlogPermitBillServiceImpl implements ITFlogPermitBillService {
             // 已在首环节：退回原地，绝不产生负环节（脏数据会把链彻底走死）
             prev = 0;
         }
-        // 退回即作废本轮签署：上一轮签过的票一律清零，重看后重新计票
+        // 退回即作废本轮签署：环节回退后票数必须同步清零，重看后按新环节重新计票
         r.setNodeNo(Integer.valueOf(prev));
+        r.setSignCount(Integer.valueOf(0));
         this.flogPermitBillMapper.updateById(r);
         return r;
     }
-    /** 统一入口守卫：不存在或已结案（已通过/已否决）一律返回 null，三个入口同一出处 */
+
+    /** 签批/否决统一前置：身份校验 + 在途守卫 + 结构校验，两个入口同一出处 */
+    private TFlogPermitBill loadForAction(Long id, String approver) {
+        if (id == null) {
+            return null;
+        }
+        if (approver == null || approver.trim().isEmpty()) {
+            return null;
+        }
+        if (approver.trim().length() > 32) {
+            return null;
+        }
+        TFlogPermitBill r = findRunning(id);
+        if (r == null) {
+            return null;
+        }
+        if (!sane(r)) {
+            return null;
+        }
+        return r;
+    }
+
+    /**
+     * 统一在途守卫（三入口同一出处）：不存在、已删除、已结案（已核讫/已打回）一律返回 null。
+     * status 缺失的存量数据按"在核"放行，交由 sane() 再做结构校验。
+     */
     private TFlogPermitBill findRunning(Long id) {
         if (id == null) {
             return null;
@@ -123,9 +136,11 @@ public class TFlogPermitBillServiceImpl implements ITFlogPermitBillService {
         if (r == null) {
             return null;
         }
-        if (r.getStatus() == null) {
-            // 存量脏数据：状态缺失按"在途"处理，交由 sane() 再做结构校验
-            return r;
+        if (r.getDelFlag() != null && r.getDelFlag().intValue() != 0) {
+            return null;
+        }
+        if (r.getStatus() != null && r.getStatus().intValue() != STATUS_RUNNING) {
+            return null;
         }
         return r;
     }
@@ -177,7 +192,7 @@ public class TFlogPermitBillServiceImpl implements ITFlogPermitBillService {
         return c > 0 ? c : 0;
     }
 
-    /** 推进环节：未到末环节则进入下一环节并清空本轮票数；末环节之后置为已通过且不再越界 */
+    /** 推进环节：未到末环节则进入下一环节并清空本轮票数；末环节签满后置为已核讫且不再越界 */
     private void advance(TFlogPermitBill r) {
         int node = r.getNodeNo() == null ? 0 : r.getNodeNo();
         int next = node + 1;
